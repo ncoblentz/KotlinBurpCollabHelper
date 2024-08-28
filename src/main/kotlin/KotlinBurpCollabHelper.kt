@@ -9,27 +9,27 @@ import burp.api.montoya.ui.contextmenu.AuditIssueContextMenuEvent
 import burp.api.montoya.ui.contextmenu.ContextMenuEvent
 import burp.api.montoya.ui.contextmenu.ContextMenuItemsProvider
 import burp.api.montoya.ui.contextmenu.WebSocketContextMenuEvent
+import com.nickcoblentz.montoya.CollabHelper
+import com.nickcoblentz.montoya.CollabHelperInteractionFilter
 import com.nickcoblentz.montoya.settings.*
 import de.milchreis.uibooster.model.Form
 import de.milchreis.uibooster.model.FormBuilder
 import java.awt.Component
 import java.util.UUID
+import java.util.function.BiConsumer
 import java.util.regex.Pattern
 
 // Montoya API Documentation: https://portswigger.github.io/burp-extensions-montoya-api/javadoc/burp/api/montoya/MontoyaApi.html
 // Montoya Extension Examples: https://github.com/PortSwigger/burp-extensions-montoya-api-examples
 
-class KotlinBurpCollabHelper : BurpExtension, ContextMenuItemsProvider {
+class KotlinBurpCollabHelper : BurpExtension {
     private lateinit var api: MontoyaApi
-    private lateinit var collaboratorClient: CollaboratorClient
-    private var shouldPollForInteactions = true
-    private var pollCollabThread : Thread? = null
 
     // Uncomment this section if you wish to use persistent settings and automatic UI Generation from: https://github.com/ncoblentz/BurpMontoyaLibrary
     // Add one or more persistent settings here
-    private lateinit var collabPayloadsSetting : StringExtensionSetting
-    private lateinit var collabSecretSetting: StringExtensionSetting
+
     private lateinit var collabFlagItemRegex: StringExtensionSetting
+    private lateinit var collabHelper : CollabHelper
 
     companion object {
         private const val PLUGIN_NAME: String = "Collab Helper"
@@ -58,33 +58,6 @@ class KotlinBurpCollabHelper : BurpExtension, ContextMenuItemsProvider {
         // Name our extension when it is displayed inside of Burp Suite
         api.extension().setName(PLUGIN_NAME)
 
-
-        collabPayloadsSetting = StringExtensionSetting(
-            // pass the montoya API to the setting
-            api,
-            // Give the setting a name which will show up in the Swing UI Form
-            "Collaborator Server",
-            // Key for where to save this setting in Burp's persistence store
-            "$PLUGIN_NAME.payload",
-            // Default value within the Swing UI Form
-            "",
-            // Whether to save it for this specific "PROJECT" or as a global Burp "PREFERENCE"
-            ExtensionSettingSaveLocation.PROJECT
-            )
-
-        collabSecretSetting = StringExtensionSetting(
-            // pass the montoya API to the setting
-            api,
-            // Give the setting a name which will show up in the Swing UI Form
-            "Collaborator Secret",
-            // Key for where to save this setting in Burp's persistence store
-            "$PLUGIN_NAME.secret",
-            // Default value within the Swing UI Form
-            "",
-            // Whether to save it for this specific "PROJECT" or as a global Burp "PREFERENCE"
-            ExtensionSettingSaveLocation.PROJECT
-        )
-
         collabFlagItemRegex = StringExtensionSetting(
             // pass the montoya API to the setting
             api,
@@ -93,81 +66,32 @@ class KotlinBurpCollabHelper : BurpExtension, ContextMenuItemsProvider {
             // Key for where to save this setting in Burp's persistence store
             "$PLUGIN_NAME.regex",
             // Default value within the Swing UI Form
-            "",
+            "nothingtomatchhere!!donotmatch!",
             // Whether to save it for this specific "PROJECT" or as a global Burp "PREFERENCE"
             ExtensionSettingSaveLocation.PROJECT
         )
 
         // Create a list of all the settings defined above
         // Don't forget to add more settings here if you define them above
-        val extensionSetting = listOf(collabSecretSetting,collabPayloadsSetting,collabFlagItemRegex)
 
-         if(collabSecretSetting.currentValue.isBlank()) {
-            collaboratorClient = api.collaborator().createClient()
-            collabSecretSetting.currentValue=collaboratorClient.secretKey.toString()
-            collabSecretSetting.save()
+        collabHelper = CollabHelper(api)
 
-        }
-        else {
-             collaboratorClient = api.collaborator().restoreClient(SecretKey.secretKey(collabSecretSetting.currentValue))
-        }
+        val collabFilter = CollabHelperInteractionFilter()
+            .withInteractionType(InteractionType.HTTP)
+            .withHttpRequestPattern(collabFlagItemRegex.currentValue)
+            .withInteractionHandler(::handleInteraction)
 
-        if(collabPayloadsSetting.currentValue.isBlank()) {
-            collabPayloadsSetting.currentValue = collaboratorClient.generatePayload().toString()
-            collabPayloadsSetting.save()
-        }
+        collabHelper.interactionObservers.add(collabFilter::handleInteraction)
 
 
+        val extensionSetting = mutableListOf(collabFlagItemRegex)
+        extensionSetting.addAll(collabHelper.extensionSettings)
 
-        pollCollabThread = Thread.ofVirtual().name("Poll Collaborator").start {
-
-            val threadId = UUID.randomUUID().toString()
-            api.logging().logToOutput("Beginning: $threadId")
-            while (shouldPollForInteactions) {
-                api.logging().logToOutput("In loop: $threadId")
-                val allInteractions = collaboratorClient.allInteractions
-                api.logging().logToOutput("${allInteractions.size} Total interactions")
-
-                val pattern = Pattern.compile(collabFlagItemRegex.currentValue)
-
-                for(interaction in allInteractions) {
-                    api.logging().logToOutput("${interaction.timeStamp()} ${interaction.type()} ${interaction.clientIp()} ${interaction.clientPort()}")
-                    if(collabFlagItemRegex.currentValue.isNotBlank() &&
-                        interaction.type() == InteractionType.HTTP &&
-                        interaction.httpDetails().isPresent) {
-
-                        val request = interaction.httpDetails().get().requestResponse().request()
-                        val requestString = request.toString()
-
-                        //api.logging().logToOutput(requestString)
-
-                        //api.logging().logToOutput("${Regex(collabFlagItemRegex.currentValue)}")
-                        val matcher = pattern.matcher(requestString)
-                        if(matcher.find()) {
-                            //api.logging().logToOutput("Found something!")
-                            val auditIssue = AuditIssue.auditIssue(
-                                AUDIT_ISSUE_NAME,
-                                AUDIT_ISSUE_DETAIL,
-                                AUDIT_ISSUE_REMEDIATION,
-                                request.url(),
-                                AuditIssueSeverity.INFORMATION,
-                                AuditIssueConfidence.FIRM,
-                                AUDIT_ISSUE_BACKGROUND,
-                                AUDIT_ISSUE_REMEDIATION_BACKGROUND,
-                                AuditIssueSeverity.INFORMATION,
-                                interaction.httpDetails().get().requestResponse()
-                            )
-                            api.siteMap().add(auditIssue)
-                        }
-
-                    }
-                }
-                Thread.sleep(5000) // Wait for 5 seconds before fetching again
-            }
-            api.logging().logToOutput("Exited: $threadId")
-        }
 
         val gen = GenericExtensionSettingsFormGenerator(extensionSetting, PLUGIN_NAME)
+        gen.addSaveCallback { formElement, form ->
+            collabFilter.httpRequestPattern=collabFlagItemRegex.currentValue
+        }
         val settingsFormBuilder: FormBuilder = gen.getSettingsFormBuilder()
         val settingsForm: Form = settingsFormBuilder.run()
 
@@ -176,34 +100,64 @@ class KotlinBurpCollabHelper : BurpExtension, ContextMenuItemsProvider {
 
         // When we unload this extension, include a callback that closes any Swing UI forms instead of just leaving them still open
         api.extension().registerUnloadingHandler(ExtensionSettingsUnloadHandler(settingsForm))
-        api.extension().registerUnloadingHandler(ExtensionUnloadingHandler {
-            api.logging().logToOutput("Shutting down virtual thread")
-            shouldPollForInteactions=false
-            pollCollabThread?.join()
-        })
 
-        // Code for setting up your extension starts here...
-
-
-
-
-
-        // Code for setting up your extension ends here
 
         // See logging comment above
         api.logging().logToOutput("...Finished loading the extension")
 
     }
 
-    override fun provideMenuItems(event: ContextMenuEvent?): MutableList<Component> {
-        return super.provideMenuItems(event)
-    }
+    /*private fun handleInteraction(interaction : Interaction) {
+        api.logging().logToOutput("Made it in here")
+        if(collabFlagItemRegex.currentValue.isNotBlank() &&
+            interaction.type() == InteractionType.HTTP &&
+            interaction.httpDetails().isPresent) {
 
-    override fun provideMenuItems(event: WebSocketContextMenuEvent?): MutableList<Component> {
-        return super.provideMenuItems(event)
-    }
+            val request = interaction.httpDetails().get().requestResponse().request()
+            val requestString = request.toString()
+            val pattern = Pattern.compile(collabFlagItemRegex.currentValue)
 
-    override fun provideMenuItems(event: AuditIssueContextMenuEvent?): MutableList<Component> {
-        return super.provideMenuItems(event)
+
+            //api.logging().logToOutput(requestString)
+
+            //api.logging().logToOutput("${Regex(collabFlagItemRegex.currentValue)}")
+            val matcher = pattern.matcher(requestString)
+            if(matcher.find()) {
+                api.logging().logToOutput("Found something!")
+                val auditIssue = AuditIssue.auditIssue(
+                    AUDIT_ISSUE_NAME,
+                    AUDIT_ISSUE_DETAIL,
+                    AUDIT_ISSUE_REMEDIATION,
+                    request.url(),
+                    AuditIssueSeverity.INFORMATION,
+                    AuditIssueConfidence.FIRM,
+                    AUDIT_ISSUE_BACKGROUND,
+                    AUDIT_ISSUE_REMEDIATION_BACKGROUND,
+                    AuditIssueSeverity.INFORMATION,
+                    interaction.httpDetails().get().requestResponse()
+                )
+                api.siteMap().add(auditIssue)
+            }
+
+        }
+    }*/
+
+    private fun handleInteraction(interaction : Interaction) {
+        api.logging().logToOutput("Found something!")
+        val requestResponse = interaction.httpDetails().get().requestResponse()
+        val request = requestResponse.request()
+        val auditIssue = AuditIssue.auditIssue(
+            AUDIT_ISSUE_NAME,
+            AUDIT_ISSUE_DETAIL,
+            AUDIT_ISSUE_REMEDIATION,
+            request.url(),
+            AuditIssueSeverity.INFORMATION,
+            AuditIssueConfidence.FIRM,
+            AUDIT_ISSUE_BACKGROUND,
+            AUDIT_ISSUE_REMEDIATION_BACKGROUND,
+            AuditIssueSeverity.INFORMATION,
+            interaction.httpDetails().get().requestResponse()
+        )
+        api.siteMap().add(auditIssue)
     }
 }
